@@ -76,7 +76,7 @@ Description=Clean Kubuntu junk
 
 [Service]
 Type=oneshot
-ExecStart=%h/PROJECTS/ubuntu_clean/clean-kubuntu.sh --apply --yes --user
+ExecStart=%h/PROJECTS/GITHUB/kbuntu_cleaner/clean-kubuntu.sh --apply --yes --user
 EOF
 
 cat > ~/.config/systemd/user/clean-kubuntu.timer <<'EOF'

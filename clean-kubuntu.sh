@@ -38,6 +38,15 @@ dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RST"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Печатает только те из переданных имён пакетов, что реально установлены.
+installed_pkgs() {
+  local n
+  for n in "$@"; do
+    dpkg-query -W -f='${Status}\n' "$n" 2>/dev/null \
+      | grep -q 'install ok installed' && printf '%s\n' "$n"
+  done
+}
+
 # Выполнить команду (или напечатать её в dry-run).
 run() {
   if (( DRY_RUN )); then
@@ -104,16 +113,25 @@ task_apt() {
 task_kernels() {
   log "Старые ядра"
   local current newest v pkg
-  local -a all
+  local -a all to_purge
   current="$(uname -r)"
-  mapfile -t all < <(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | sort -V)
+  # Версионные образы ядра, включая варианты linux-image-unsigned-...
+  mapfile -t all < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
+                       | grep -E '^linux-image-(unsigned-)?[0-9]' | sort -V)
   ((${#all[@]})) || { dim "нечего чистить"; return 0; }
-  newest="${all[${#all[@]}-1]}"
+  # «Самый новый» сравниваем по версии, а не по имени пакета: иначе unsigned-
+  # вариант посчитался бы отдельным ядром и новейший образ мог не сохраниться.
+  newest="$(printf '%s\n' "${all[@]}" | sed -E 's/^linux-image-(unsigned-)?//' | sort -V | tail -n1)"
   for pkg in "${all[@]}"; do
     v="${pkg#linux-image-}"; v="${v#unsigned-}"
-    [[ "$v" == "$current" || "$pkg" == "$newest" ]] && continue
-    run "${SUDO[@]}" apt-get -y purge "linux-image-$v" "linux-headers-$v" \
-        "linux-modules-$v" "linux-modules-extra-$v" 2>/dev/null
+    [[ "$v" == "$current" || "$v" == "$newest" ]] && continue
+    # purge только реально установленных пакетов: apt-get отказывается удалять
+    # что-либо, если хотя бы одного имени нет, и ядро тогда остаётся на месте.
+    mapfile -t to_purge < <(installed_pkgs \
+      "$pkg" "linux-headers-$v" "linux-headers-${v%-*}" \
+      "linux-modules-$v" "linux-modules-extra-$v")
+    ((${#to_purge[@]})) || continue
+    run "${SUDO[@]}" apt-get -y purge "${to_purge[@]}"
   done
 }
 task_journal() {
@@ -230,7 +248,13 @@ for t in "${TASKS[@]}"; do
   case "$t" in apt|kernels|journal|tmp|snap) needs_root=1 ;; esac
 done
 if (( needs_root )) && (( EUID != 0 )); then
-  if have sudo; then SUDO=(sudo); else err "нужны права root, но sudo недоступен"; exit 1; fi
+  if have sudo; then
+    SUDO=(sudo)
+  elif (( DRY_RUN )); then
+    warn "sudo недоступен — предпросмотр без повышения прав"
+  else
+    err "нужны права root, но sudo недоступен"; exit 1
+  fi
 fi
 
 # ------------------------------------------------------------------ запуск
