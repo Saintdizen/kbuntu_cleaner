@@ -27,12 +27,14 @@ chmod +x clean-kubuntu.sh
 | `--system`       | `journal`      | Журнал systemd, оставляется ≤ 200M                      | sudo  |
 | `--system`       | `tmp`          | `/tmp` и `/var/tmp` старше 7 дней                       | sudo  |
 | `--snap`         | `snap`         | Отключённые (disabled) ревизии snap                     | sudo  |
-| `--flatpak`      | `flatpak`      | Неиспользуемые runtime (`uninstall --unused`)           | нет   |
-| `--docker`       | `docker`       | `docker system prune -af --volumes`                     | нет\* |
+| `--flatpak`      | `flatpak`      | Неиспользуемые runtime: user + system (`--unused`)      | частично\* |
+| `--docker`       | `docker`       | Остановленные контейнеры, образы и кеш сборки старше 7 дней | да\*\* |
 | `--baloo`        | `baloo`        | Индекс поиска KDE (переиндексируется сам)               | нет   |
 | `--browsercache` | `browsercache` | Кеши Firefox/Chrome/Chromium/Brave/Opera/Vivaldi/Yandex | нет   |
 
-\* Docker берётся от текущего пользователя; если нужен root — запустите скрипт от root.
+\* Пользовательская инсталляция чистится без прав, системная — через `sudo`/root.
+\*\* Нужны root или членство в группе `docker`. Тома по умолчанию **не** удаляются;
+для их очистки добавьте `--docker-volumes` (необратимо).
 
 По умолчанию (без указания задач) выполняются `--user`, `--system`, `--snap`,
 `--flatpak`. Тяжёлые задачи (`--docker`, `--baloo`, `--browsercache`) в группы не
@@ -76,7 +78,7 @@ Description=Clean Kubuntu junk
 
 [Service]
 Type=oneshot
-ExecStart=%h/PROJECTS/GITHUB/kbuntu_cleaner/clean-kubuntu.sh --apply --yes --user
+ExecStart=%h/chui_ide_project/GITHUB/kbuntu_cleaner/clean-kubuntu.sh --apply --yes --user
 EOF
 
 cat > ~/.config/systemd/user/clean-kubuntu.timer <<'EOF'

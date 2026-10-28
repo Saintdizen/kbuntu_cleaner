@@ -20,8 +20,12 @@ SCRIPT_NAME="$(basename "$0")"
 # ------------------------------------------------------------------ настройки
 DRY_RUN=1
 ASSUME_YES=0
-JOURNAL_MAX_SIZE="200M"
-TMP_KEEP_DAYS=7
+JOURNAL_MAX_SIZE="${JOURNAL_MAX_SIZE:-200M}"
+TMP_KEEP_DAYS="${TMP_KEEP_DAYS:-7}"
+# Docker: образы старше N часов считаются неиспользуемыми; тома не трогаем
+# без явного --docker-volumes (это необратимая потеря данных).
+DOCKER_KEEP_HOURS="${DOCKER_KEEP_HOURS:-168}"
+DOCKER_PRUNE_VOLUMES=0
 
 # ------------------------------------------------------------------ утилиты
 if [[ -t 1 ]]; then
@@ -40,11 +44,15 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # Печатает только те из переданных имён пакетов, что реально установлены.
 installed_pkgs() {
-  local n
+  local n st
   for n in "$@"; do
-    dpkg-query -W -f='${Status}\n' "$n" 2>/dev/null \
-      | grep -q 'install ok installed' && printf '%s\n' "$n"
+    # Без пайпа в grep -q: тот закрывает pipe раньше чтения, и при pipefail
+    # пайплайн получает SIGPIPE-статус — установленный пакет ошибочно
+    # считался бы отсутствующим.
+    st="$(dpkg-query -W -f='${Status}' "$n" 2>/dev/null)" || continue
+    [[ "$st" == *'install ok installed'* ]] && printf '%s\n' "$n"
   done
+  return 0
 }
 
 # Выполнить команду (или напечатать её в dry-run).
@@ -80,7 +88,7 @@ task_trash()      { log "Корзина"
                     if (( DRY_RUN )); then
                       dim "dry-run: очистить '$HOME/.local/share/Trash/info'"
                     else
-                      find "$HOME/.local/share/Trash/info" -type f -delete 2>/dev/null || true
+                      find "$HOME/.local/share/Trash/info" -mindepth 1 -type f -delete 2>/dev/null || true
                     fi; }
 task_thumbnails() { log "Кеш миниатюр";          rm_paths "$HOME/.cache/thumbnails"; }
 task_fontcache()  { log "Кеш шрифтов"
@@ -92,10 +100,27 @@ task_fontcache()  { log "Кеш шрифтов"
 task_recent()     { log "Недавние документы";    rm_paths "$HOME/.local/share/RecentDocuments"; }
 task_baloo()      { log "Индекс поиска Baloo"
                     if have balooctl6; then run balooctl6 purge; elif have balooctl; then run balooctl purge; else warn "balooctl не найден"; fi; }
-task_browsercache() { log "Кеши браузеров"
-                    rm_paths "$HOME/.cache/mozilla/firefox" "$HOME/.cache/chromium" \
-                             "$HOME/.cache/google-chrome" "$HOME/.cache/BraveSoftware" \
-                             "$HOME/.cache/opera" "$HOME/.cache/vivaldi" "$HOME/.cache/yandex-browser"; }
+task_browsercache() {
+  log "Кеши браузеров"
+  local base d
+  local -a roots=(
+    "$HOME/.cache/mozilla/firefox" "$HOME/.cache/chromium"
+    "$HOME/.cache/google-chrome" "$HOME/.cache/BraveSoftware"
+    "$HOME/.cache/opera" "$HOME/.cache/vivaldi" "$HOME/.cache/yandex-browser"
+  )
+  # Удаляются только каталоги кеша внутри профилей: сами профили, Local State
+  # и закладки остаются на месте (раньше сносился корень кеша целиком).
+  for base in "${roots[@]}"; do
+    [[ -d "$base" ]] || continue
+    while IFS= read -r -d '' d; do
+      rm_paths "$d"
+    done < <(find "$base" -mindepth 1 -maxdepth 3 -type d \( \
+               -name 'Cache' -o -name 'cache2' -o -name 'Code Cache' \
+               -o -name 'GPUCache' -o -name 'ShaderCache' -o -name 'CacheStorage' \
+               -o -name 'startupCache' -o -name 'thumbnails' \
+             \) -print0 2>/dev/null)
+  done
+}
 
 # Системные
 task_apt() {
@@ -140,7 +165,14 @@ task_journal() {
 }
 task_tmp() {
   log "Временные файлы в /tmp и /var/tmp старше $TMP_KEEP_DAYS дней"
-  run "${SUDO[@]}" find /tmp /var/tmp -xdev -mindepth 1 -mtime "+$TMP_KEEP_DAYS" -exec rm -rf -- {} +
+  # Служебные каталоги (X11/ICE/font, systemd-private, snap, активные сессии)
+  # пропускаем: иначе долгая сессия теряет сокеты и авторизацию.
+  run "${SUDO[@]}" find /tmp /var/tmp -xdev -mindepth 1 -maxdepth 1 \
+      \( -name '.X*-lock' -o -name '.X11-unix' -o -name '.ICE-unix' \
+         -o -name '.XIM-unix' -o -name '.font-unix' -o -name '.Test-unix' \
+         -o -name 'systemd-private-*' -o -name 'snap-private-tmp' \
+         -o -name 'ssh-*' -o -name 'kde-*' -o -name 'kmail-*' \
+      \) -prune -o -mtime "+$TMP_KEEP_DAYS" -exec rm -rf -- {} +
 }
 task_snap() {
   log "Snap: отключённые ревизии"
@@ -154,12 +186,34 @@ task_snap() {
 task_flatpak() {
   log "Flatpak: неиспользуемые среды выполнения"
   have flatpak || { dim "flatpak не установлен"; return 0; }
+  # без --system чистится только пользовательская инсталляция
   run flatpak uninstall --unused -y
+  if (( EUID == 0 )); then
+    run flatpak uninstall --unused -y --system
+  elif ((${#SUDO[@]})); then
+    run "${SUDO[@]}" flatpak uninstall --unused -y --system
+  else
+    dim "sudo недоступен: системные runtime не проверяются"
+  fi
 }
 task_docker() {
-  log "Docker: неиспользуемые образы/тома/кеш сборки"
+  log "Docker: остановленные контейнеры, старые образы, кеш сборки"
   have docker || { dim "docker не установлен"; return 0; }
-  run docker system prune -af --volumes
+  if (( ! DRY_RUN )) && ! docker info >/dev/null 2>&1; then
+    warn "нет доступа к Docker (нужен root или группа docker)"
+    return 0
+  fi
+  # Вместо `system prune -af --volumes`: образы с активным контейнером и все
+  # тома по умолчанию остаются, удаляется только заведомо мусорное.
+  run docker container prune -f
+  run docker image prune -af --filter "until=${DOCKER_KEEP_HOURS}h"
+  run docker builder prune -af --filter "until=${DOCKER_KEEP_HOURS}h"
+  if (( DOCKER_PRUNE_VOLUMES )); then
+    warn "удаление ВСЕХ неиспользуемых томов — данные будут потеряны"
+    run docker volume prune -f
+  else
+    dim "тома не трогаем (для удаления добавьте --docker-volumes)"
+  fi
 }
 
 # Группы
@@ -190,9 +244,14 @@ $SCRIPT_NAME — уборка мусора в Kubuntu.
   --system          apt, ядра, журнал, /tmp                     [нужен sudo]
   --snap            старые ревизии snap
   --flatpak         неиспользуемые runtime flatpak
-  --docker          docker system prune (образы, тома, кеш)
+  --docker          остановленные контейнеры, образы и кеш сборки старше 7 дней
+  --docker-volumes  вместе с --docker удалить неиспользуемые тома (данные!)
   --trash --thumbnails --fontcache --recent --baloo --browsercache
   --apt --kernels --journal --tmp
+
+Тонкая настройка:
+  --journal-size=SIZE   сколько журнала оставлять (сейчас $JOURNAL_MAX_SIZE)
+  --tmp-days=N          возраст временных файлов в /tmp (сейчас $TMP_KEEP_DAYS)
 
 По умолчанию (без указания задач) выполняются: --user --system --snap --flatpak
 EOF
@@ -212,6 +271,9 @@ while (($#)); do
     --system)     add_task "${SYSTEM_TASKS[@]}" ;;
     --snap)       add_task snap ;;
     --flatpak)    add_task flatpak ;;
+    --journal-size=*) JOURNAL_MAX_SIZE="${1#*=}" ;;
+    --tmp-days=*)     TMP_KEEP_DAYS="${1#*=}" ;;
+    --docker-volumes) DOCKER_PRUNE_VOLUMES=1 ;;
     --docker)     add_task docker ;;
     --trash)      add_task trash ;;
     --thumbnails) add_task thumbnails ;;
@@ -257,6 +319,17 @@ if (( needs_root )) && (( EUID != 0 )); then
   fi
 fi
 
+# ------------------------------------------------------------------ блокировка
+# Два одновременных запуска (cron + руками) дерутся за apt/snap/flatpak-локи.
+if have flock; then
+  LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/clean-kubuntu.$(id -u).lock"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    warn "уже выполняется другой экземпляр (lock: $LOCK_FILE)"
+    exit 0
+  fi
+fi
+
 # ------------------------------------------------------------------ запуск
 if (( DRY_RUN )); then
   log "РЕЖИМ ПРЕДПРОСМОТРА — ничего не будет удалено (используйте --apply)"
@@ -267,19 +340,28 @@ dim "задачи: ${TASKS[*]}"
 echo
 
 if (( ! DRY_RUN && ! ASSUME_YES )); then
-  read -r -p "Продолжить удаление? [y/N] " a
+  a=""
+  # Без tty (cron/CI) read возвращает ошибку, и "$a" осталась бы неопределённой:
+  # при set -u это обрывало бы скрипт вместо чистого отказа.
+  [[ -t 0 ]] && read -r -p "Продолжить удаление? [y/N] " a
   [[ "$a" == [yYдД]* ]] || { warn "отменено"; exit 0; }
 fi
 
+rc=0
 for t in "${TASKS[@]}"; do
   if declare -F "task_$t" >/dev/null; then
-    "task_$t" || warn "задача '$t' завершилась с ошибкой"
+    "task_$t" || { warn "задача '$t' завершилась с ошибкой"; rc=1; }
     echo
   else
     warn "задача '$t' не найдена"
+    rc=1
   fi
 done
 
-log "Готово."
+if (( rc == 0 )); then
+  log "Готово."
+else
+  warn "Готово с ошибками — см. сообщения выше (код возврата 1)."
+fi
 (( DRY_RUN )) && dim "Это был предпросмотр. Запустите с --apply для реальной уборки."
-exit 0
+exit "$rc"
