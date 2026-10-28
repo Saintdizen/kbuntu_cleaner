@@ -31,14 +31,19 @@ chmod +x clean-kubuntu.sh
 | `--docker`       | `docker`       | Остановленные контейнеры, образы и кеш сборки старше 7 дней | да\*\* |
 | `--baloo`        | `baloo`        | Индекс поиска KDE (переиндексируется сам)               | нет   |
 | `--browsercache` | `browsercache` | Кеши Firefox/Chrome/Chromium/Brave/Opera/Vivaldi/Yandex | нет   |
+| `--devcache`     | `devcache`     | Кеши pip, npm, yarn, electron, go-build, cargo, gradle, m2 | нет   |
+| `--idecache`     | `idecache`     | JetBrains: `full-line`, `log`, `tmp` (индексы целы)      | нет   |
+| `--crash`        | `crash`        | Отчёты о падениях: `kcrash`, `~/.xsession-errors*`, `/var/crash` | sudo |
+| `--syslog`       | `syslog`       | Ротированные логи `/var/log` старше 14 дней              | sudo  |
 
 \* Пользовательская инсталляция чистится без прав, системная — через `sudo`/root.
 \*\* Нужны root или членство в группе `docker`. Тома по умолчанию **не** удаляются;
 для их очистки добавьте `--docker-volumes` (необратимо).
 
 По умолчанию (без указания задач) выполняются `--user`, `--system`, `--snap`,
-`--flatpak`. Тяжёлые задачи (`--docker`, `--baloo`, `--browsercache`) в группы не
-входят и включаются только явным флагом.
+`--flatpak`. Тяжёлые и необратимые задачи (`--docker`, `--baloo`, `--browsercache`,
+`--devcache`, `--idecache`, `--crash`, `--syslog`) в группы не входят и
+включаются только явным флагом.
 
 ## Примеры
 
@@ -51,6 +56,9 @@ chmod +x clean-kubuntu.sh
 
 # Освободить место в Docker
 ./clean-kubuntu.sh --apply --docker
+
+# Кеши разработки и IDE (сотни мегабайт, восстанавливаются сами)
+./clean-kubuntu.sh --apply --devcache --idecache
 
 # Список всех доступных задач
 ./clean-kubuntu.sh --list

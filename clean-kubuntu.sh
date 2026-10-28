@@ -22,6 +22,8 @@ DRY_RUN=1
 ASSUME_YES=0
 JOURNAL_MAX_SIZE="${JOURNAL_MAX_SIZE:-200M}"
 TMP_KEEP_DAYS="${TMP_KEEP_DAYS:-7}"
+# Возраст ротированного лога в /var/log, после которого его можно удалять
+LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-14}"
 # Docker: образы старше N часов считаются неиспользуемыми; тома не трогаем
 # без явного --docker-volumes (это необратимая потеря данных).
 DOCKER_KEEP_HOURS="${DOCKER_KEEP_HOURS:-168}"
@@ -122,6 +124,35 @@ task_browsercache() {
   done
 }
 
+# Кеши инструментов разработки: восстанавливаются сами при следующей сборке,
+# но занимают сотни мегабайт.
+task_devcache() { log "Кеши dev-инструментов"
+                  rm_paths "$HOME/.cache/pip" "$HOME/.cache/electron" \
+                           "$HOME/.npm/_cacache" "$HOME/.cache/yarn" \
+                           "$HOME/.cache/go-build" "$HOME/.cargo/registry/cache" \
+                           "$HOME/.cache/ms-playwright" "$HOME/.m2/repository" \
+                           "$HOME/.gradle/caches"; }
+# Кеши JetBrains: только то, что IDE строит заново сама. Индексы не трогаем —
+# их пересборка занимает долгие минуты.
+task_idecache() { log "Кеши JetBrains (full-line, логи, tmp)"
+                  local d
+                  for d in "$HOME"/.cache/JetBrains/*/full-line \
+                           "$HOME"/.cache/JetBrains/*/log \
+                           "$HOME"/.cache/JetBrains/*/tmp; do
+                    rm_paths "$d"
+                  done; }
+task_crash()    { log "Отчёты о падениях"
+                  rm_paths "$HOME/.cache/kcrash" "$HOME/.xsession-errors" \
+                           "$HOME/.xsession-errors.old"
+                  # /var/crash может содержать чувствительные данные — только явно
+                  run "${SUDO[@]}" find /var/crash -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; }
+# Ротированные логи старше N дней; активные *.log не затрагиваются.
+task_syslog()   { log "Старые логи /var/log (> $LOG_KEEP_DAYS дней)"
+                  run "${SUDO[@]}" find /var/log -xdev -type f \
+                      \( -name '*.gz' -o -name '*.xz' -o -name '*.old' \
+                         -o -name '*.1' -o -name '*.2' -o -name '*.3' \
+                      \) -mtime "+$LOG_KEEP_DAYS" -delete; }
+
 # Системные
 task_apt() {
   log "APT: кеш пакетов, автоочистка, осиротевшие пакеты"
@@ -221,7 +252,7 @@ USER_TASKS=(trash thumbnails fontcache recent)
 SYSTEM_TASKS=(apt kernels journal tmp)
 EXTRA_TASKS=(snap flatpak)
 # Не входит ни в одну группу: включается только своим флагом
-OPTIONAL_TASKS=(docker baloo browsercache)
+OPTIONAL_TASKS=(docker baloo browsercache devcache idecache crash syslog)
 
 TASKS=()
 
@@ -248,10 +279,12 @@ $SCRIPT_NAME — уборка мусора в Kubuntu.
   --docker-volumes  вместе с --docker удалить неиспользуемые тома (данные!)
   --trash --thumbnails --fontcache --recent --baloo --browsercache
   --apt --kernels --journal --tmp
+  --devcache --idecache --crash --syslog   (только по явному выбору)
 
 Тонкая настройка:
   --journal-size=SIZE   сколько журнала оставлять (сейчас $JOURNAL_MAX_SIZE)
   --tmp-days=N          возраст временных файлов в /tmp (сейчас $TMP_KEEP_DAYS)
+  --log-days=N          возраст ротированных логов /var/log (сейчас $LOG_KEEP_DAYS)
 
 По умолчанию (без указания задач) выполняются: --user --system --snap --flatpak
 EOF
@@ -273,6 +306,7 @@ while (($#)); do
     --flatpak)    add_task flatpak ;;
     --journal-size=*) JOURNAL_MAX_SIZE="${1#*=}" ;;
     --tmp-days=*)     TMP_KEEP_DAYS="${1#*=}" ;;
+    --log-days=*)     LOG_KEEP_DAYS="${1#*=}" ;;
     --docker-volumes) DOCKER_PRUNE_VOLUMES=1 ;;
     --docker)     add_task docker ;;
     --trash)      add_task trash ;;
@@ -285,6 +319,10 @@ while (($#)); do
     --kernels)    add_task kernels ;;
     --journal)    add_task journal ;;
     --tmp)        add_task tmp ;;
+    --devcache)   add_task devcache ;;
+    --idecache)   add_task idecache ;;
+    --crash)      add_task crash ;;
+    --syslog)     add_task syslog ;;
     -*)           err "неизвестный ключ: $1"; usage; exit 2 ;;
     *)            err "неизвестный аргумент: $1"; usage; exit 2 ;;
   esac
@@ -307,7 +345,7 @@ fi
 SUDO=()
 needs_root=0
 for t in "${TASKS[@]}"; do
-  case "$t" in apt|kernels|journal|tmp|snap) needs_root=1 ;; esac
+  case "$t" in apt|kernels|journal|tmp|snap|syslog|crash) needs_root=1 ;; esac
 done
 if (( needs_root )) && (( EUID != 0 )); then
   if have sudo; then
