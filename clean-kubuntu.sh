@@ -24,6 +24,12 @@ JOURNAL_MAX_SIZE="${JOURNAL_MAX_SIZE:-200M}"
 TMP_KEEP_DAYS="${TMP_KEEP_DAYS:-7}"
 # Возраст ротированного лога в /var/log, после которого его можно удалять
 LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-14}"
+# Снимки настроек KDE и что в них попадает
+KDE_BACKUP_DIR="${KDE_BACKUP_DIR:-$HOME/.local/share/clean-kubuntu/backups}"
+KDE_BACKUP_KEEP="${KDE_BACKUP_KEEP:-5}"
+KDE_FILES=(.config/plasma-org.kde.plasma.desktop-appletsrc .config/plasmarc
+           .config/kdeglobals .config/kactivitymanagerdrc .config/kwinrc
+           .config/kscreenlockerrc .config/konsolerc .config/katerc)
 # Docker: образы старше N часов считаются неиспользуемыми; тома не трогаем
 # без явного --docker-volumes (это необратимая потеря данных).
 DOCKER_KEEP_HOURS="${DOCKER_KEEP_HOURS:-168}"
@@ -153,6 +159,102 @@ task_syslog()   { log "Старые логи /var/log (> $LOG_KEEP_DAYS дней
                          -o -name '*.1' -o -name '*.2' -o -name '*.3' \
                       \) -mtime "+$LOG_KEEP_DAYS" -delete; }
 
+# ------------------------------------------------------------- настройки KDE
+# Снимок конфигов Plasma. Без него восстановление невозможно, поэтом
+task_kdebackup() {
+  log "Снимок настроек KDE"
+  local f
+  f="$KDE_BACKUP_DIR/kde-$(date +%Y%m%d-%H%M%S).tar.gz"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$KDE_BACKUP_DIR" || { err "не удалось создать $KDE_BACKUP_DIR"; return 1; }
+  else
+    dim "mkdir -p $KDE_BACKUP_DIR"
+  fi
+  # -C $HOME и пути относительно него: архив разворачивается той же командой
+  local -a files=()
+  local f_rel
+  for f_rel in "${KDE_FILES[@]}"; do
+    [[ -e "$HOME/$f_rel" ]] && files+=("$f_rel")
+  done
+  if ((${#files[@]} == 0)); then
+    warn "ни один из конфигов KDE не найден — снимок не создан"
+    return 0
+  fi
+  ((${#files[@]} < ${#KDE_FILES[@]})) && dim "в снимок попадёт ${#files[@]} из ${#KDE_FILES[@]} файлов (остальных нет)"
+  run tar czf "$f" -C "$HOME" "${files[@]}"
+  dim "архив: $f"
+  # держим последние KDE_BACKUP_KEEP снимков
+  (( DRY_RUN )) || find "$KDE_BACKUP_DIR" -maxdepth 1 -name 'kde-*.tar.gz' \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n "+$((KDE_BACKUP_KEEP + 1))" \
+    | cut -d' ' -f2- | xargs -r rm -f --
+}
+
+# Диагностика: значки рабочего стола живут в контейнере org.kde.plasma.folder.
+task_kdecheck() {
+  log "Проверка настроек рабочего стола Plasma"
+  local rc_file="$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+  local desk
+  desk="$(xdg-user-dir DESKTOP 2>/dev/null || printf '%s/Desktop' "$HOME")"
+  if [[ ! -f "$rc_file" ]]; then
+    warn "нет $rc_file — конфиг рабочего стола отсутствует"
+  else
+    dim "файл: $rc_file"
+    local n
+    n="$(grep -c '^plugin=org.kde.plasma.folder$' "$rc_file" 2>/dev/null || printf 0)"
+    if (( n > 0 )); then
+      dim "контейнер рабочего стола (Folder View) найден: $n шт."
+    else
+      warn "контейнер org.kde.plasma.folder не найден — значки показывать нечему"
+      dim "лечится в GUI: ПКМ по рабочему столу → Настроить рабочий стол → Раскладка: Папка"
+    fi
+  fi
+  if [[ -d "$desk" ]]; then
+    dim "каталог значков: $desk ($(find "$desk" -mindepth 1 -maxdepth 1 | wc -l) элементов)"
+  else
+    warn "каталог значков не существует: $desk"
+  fi
+  if [[ -d "$KDE_BACKUP_DIR" ]] && ls "$KDE_BACKUP_DIR"/kde-*.tar.gz >/dev/null 2>&1; then
+    dim "доступные снимки: $(ls -1 "$KDE_BACKUP_DIR"/kde-*.tar.gz | wc -l) (свежий: $(basename "$(ls -1t "$KDE_BACKUP_DIR"/kde-*.tar.gz | head -1)"))"
+  else
+    dim "снимков нет: сделайте --kde-backup ДО поломки"
+  fi
+}
+
+# Восстановление последнего снимка + перезапуск plasmashell.
+task_kderestore() {
+  log "Восстановление настроек KDE из снимка"
+  local snap
+  snap="$(ls -1t "$KDE_BACKUP_DIR"/kde-*.tar.gz 2>/dev/null | head -1)"
+  if [[ -z "$snap" ]]; then
+    warn "снимков в $KDE_BACKUP_DIR нет — восстанавливать нечего"
+    dim "на будущее: ./clean-kubuntu.sh --kde-backup"
+    return 0
+  fi
+  dim "снимок: $snap"
+  # Страховка: текущее состояние тоже сохраняем, чтобы откатить сам откат.
+  if (( ! DRY_RUN )); then
+    local pre
+    pre="$KDE_BACKUP_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local -a files=() f_rel
+    for f_rel in "${KDE_FILES[@]}"; do
+      [[ -e "$HOME/$f_rel" ]] && files+=("$f_rel")
+    done
+    ((${#files[@]})) && run tar czf "$pre" -C "$HOME" "${files[@]}"
+  fi
+  # распаковка поверх $HOME перезапишет только файлы из архива
+  run tar xzf "$snap" -C "$HOME"
+  if (( DRY_RUN )); then
+    dim "затем перезапуск plasmashell"
+    return 0
+  fi
+  if systemctl --user list-unit-files 2>/dev/null | grep -q '^plasma-plasmashell\.service'; then
+    run systemctl --user restart plasma-plasmashell.service
+  else
+    run kquitapp6 plasmashell
+    run setsid plasmashell >/dev/null 2>&1
+  fi
+}
+
 # Системные
 task_apt() {
   log "APT: кеш пакетов, автоочистка, осиротевшие пакеты"
@@ -252,7 +354,8 @@ USER_TASKS=(trash thumbnails fontcache recent)
 SYSTEM_TASKS=(apt kernels journal tmp)
 EXTRA_TASKS=(snap flatpak)
 # Не входит ни в одну группу: включается только своим флагом
-OPTIONAL_TASKS=(docker baloo browsercache devcache idecache crash syslog)
+OPTIONAL_TASKS=(docker baloo browsercache devcache idecache crash syslog
+                kdebackup kdecheck kderestore)
 
 TASKS=()
 
@@ -280,6 +383,11 @@ $SCRIPT_NAME — уборка мусора в Kubuntu.
   --trash --thumbnails --fontcache --recent --baloo --browsercache
   --apt --kernels --journal --tmp
   --devcache --idecache --crash --syslog   (только по явному выбору)
+
+Настройки KDE (не уборка, а страховка и ремонт):
+  --kde-backup      сохранить снимок конфигов Plasma/Konsole/Kate
+  --kde-check       диагностика рабочего стола: есть ли Folder View и значки
+  --kde-restore     вернуть последний снимок и перезапустить plasmashell
 
 Тонкая настройка:
   --journal-size=SIZE   сколько журнала оставлять (сейчас $JOURNAL_MAX_SIZE)
@@ -323,6 +431,9 @@ while (($#)); do
     --idecache)   add_task idecache ;;
     --crash)      add_task crash ;;
     --syslog)     add_task syslog ;;
+    --kde-backup) add_task kdebackup ;;
+    --kde-check)  add_task kdecheck ;;
+    --kde-restore) add_task kderestore ;;
     -*)           err "неизвестный ключ: $1"; usage; exit 2 ;;
     *)            err "неизвестный аргумент: $1"; usage; exit 2 ;;
   esac

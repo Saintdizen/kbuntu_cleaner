@@ -35,6 +35,9 @@ chmod +x clean-kubuntu.sh
 | `--idecache`     | `idecache`     | JetBrains: `full-line`, `log`, `tmp` (индексы целы)      | нет   |
 | `--crash`        | `crash`        | Отчёты о падениях: `kcrash`, `~/.xsession-errors*`, `/var/crash` | sudo |
 | `--syslog`       | `syslog`       | Ротированные логи `/var/log` старше 14 дней              | sudo  |
+| `--kde-backup`   | `kdebackup`    | Снимок конфигов Plasma/Konsole/Kate в `~/.local/share/clean-kubuntu/backups` | нет |
+| `--kde-check`    | `kdecheck`     | Диагностика рабочего стола: Folder View, каталог значков, снимки | нет |
+| `--kde-restore`  | `kderestore`   | Вернуть последний снимок и перезапустить plasmashell    | нет   |
 
 \* Пользовательская инсталляция чистится без прав, системная — через `sudo`/root.
 \*\* Нужны root или членство в группе `docker`. Тома по умолчанию **не** удаляются;
@@ -104,6 +107,30 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now clean-kubuntu.timer
 ```
+
+## Настройки KDE: снимок и восстановление
+
+Уборка здесь ни при чём — это страховка и ремонт рабочего стола.
+Снимок делайте **до** экспериментов с темой/плазмоидами:
+
+```bash
+./clean-kubuntu.sh --apply --kde-backup     # сохранить конфиги
+./clean-kubuntu.sh --kde-check              # что с рабочим столом сейчас
+./clean-kubuntu.sh --apply --kde-restore    # вернуть последний снимок
+```
+
+`--kde-backup` кладёт в архив `~/.config/plasma-org.kde.plasma.desktop-appletsrc`,
+`plasmarc`, `kdeglobals`, `kactivitymanagerdrc`, `kwinrc`, `kscreenlockerrc`,
+`konsolerc`, `katerc`; хранятся последние 5 снимков (`KDE_BACKUP_KEEP`).
+`--kde-restore` перед распаковкой сам делает `pre-restore-*.tar.gz`, затем
+перезапускает `plasma-plasmashell.service` (или `plasmashell --replace`).
+
+Если значки на рабочем столе пропали, а снимка нет — восстановить из архива
+нечего; сначала проверьте `--kde-check`: он скажет, есть ли контейнер
+`org.kde.plasma.folder` (Folder View) и существует ли каталог значков.
+Без снимка лечится вручную: правый клик по рабочему столу → «Настроить
+рабочий стол и обои» → Layout: **Folder View**, либо добавление виджета
+«Значки рабочего стола».
 
 ## Замечания по безопасности
 
